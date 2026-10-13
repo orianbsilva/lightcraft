@@ -1,6 +1,10 @@
-//! The window's renderer and its fallback chain (crash report: on some Windows machines FXC fails
-//! to compile egui's own shaders on DX12 — "The parameter is incorrect. (0x80070057)" in
+//! The window's renderer and its fallback chain (crash report #812: on some Windows machines the
+//! DX12 driver rejects egui's own pipeline — "The parameter is incorrect. (0x80070057)" in
 //! `egui_pipeline` — and wgpu's default error handler panicked, killing the app at start-up).
+//! FXC compiles the shaders; it is `CreatePipelineState` that fails (wgpu reports both stages, so
+//! the error is the pipeline state, not one shader). Seen on RTX 5090 machines with an AMD iGPU
+//! (#812, #1366); the probe logs the adapter it used and the others it could have, so a report
+//! says which one the driver refused.
 //!
 //! - **Windows:** each renderer of [`backend::window_renderer_order`] (DX12, Vulkan, GL, then
 //!   eframe's glow) is *probed* before the window opens: a device is created with an error handler
@@ -180,18 +184,43 @@ fn probe(backends: Backends) -> Result<WgpuSetupExisting, String> {
         ..Default::default()
     }))
     .map_err(|e| format!("no adapter: {e}"))?;
-    let base = if adapter.get_info().backend == wgpu::Backend::Gl { wgpu::Limits::downlevel_webgl2_defaults() } else { wgpu::Limits::default() };
-    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+    let info = adapter.get_info();
+    log::info!("window: probing {}", describe(&info));
+    let base = if info.backend == wgpu::Backend::Gl { wgpu::Limits::downlevel_webgl2_defaults() } else { wgpu::Limits::default() };
+    let built = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("egui wgpu device"),
         required_limits: wgpu::Limits { max_texture_dimension_2d: 8192, ..base },
         ..Default::default()
     }))
-    .map_err(|e| format!("{}: no device: {e}", adapter.get_info().name))?;
-    install_error_handler(&device);
-    check_pipeline(&device, |d| {
-        drop(eframe::egui_wgpu::Renderer::new(d, wgpu::TextureFormat::Bgra8Unorm, eframe::egui_wgpu::RendererOptions::default()));
-    })?;
-    Ok(WgpuSetupExisting { instance, adapter, device, queue })
+    .map_err(|e| format!("{}: no device: {e}", info.name))
+    .and_then(|(device, queue)| {
+        install_error_handler(&device);
+        check_pipeline(&device, |d| {
+            drop(eframe::egui_wgpu::Renderer::new(d, wgpu::TextureFormat::Bgra8Unorm, eframe::egui_wgpu::RendererOptions::default()));
+        })
+        .map_err(|e| format!("{}: {e}", info.name))?;
+        Ok((device, queue))
+    });
+    match built {
+        Ok((device, queue)) => Ok(WgpuSetupExisting { instance, adapter, device, queue }),
+        Err(e) => {
+            // the "probing" line names the adapter the driver refused; these are the ones it could have used
+            for other in pollster::block_on(instance.enumerate_adapters(backends)) {
+                log::info!("window: {:?} adapter available: {}", info.backend, describe(&other.get_info()));
+            }
+            Err(e)
+        }
+    }
+}
+
+/// An adapter for the log: name, backend, type, PCI ids and driver (what a report needs to tell
+/// two GPUs, or two drivers, apart).
+fn describe(info: &wgpu::AdapterInfo) -> String {
+    let mut driver = [info.driver.as_str(), info.driver_info.as_str()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" ");
+    if driver.is_empty() {
+        driver = "unknown".into();
+    }
+    format!("{} ({:?}, {:?}, vendor 0x{:04x} device 0x{:04x}, driver {driver})", info.name, info.backend, info.device_type, info.vendor, info.device)
 }
 
 /// wgpu's default handler for errors outside an error scope panics ("Handling wgpu errors as
@@ -312,5 +341,31 @@ mod tests {
         .unwrap();
         // outside a scope: logged by our handler, not a panic
         let _ = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl("not wgsl".into()) });
+    }
+
+    /// #1366: the log names the adapter a probe used precisely enough to tell two GPUs (or two
+    /// drivers) apart. Needs an adapter for its `AdapterInfo`; skipped where there is none.
+    #[test]
+    fn describe_names_the_adapter_and_driver() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: backend::window_backends(),
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+            eprintln!("no GPU adapter: skipped");
+            return;
+        };
+        let mut info = adapter.get_info();
+        info.name = "NVIDIA GeForce RTX 5090".into();
+        info.backend = wgpu::Backend::Dx12;
+        info.device_type = wgpu::DeviceType::DiscreteGpu;
+        info.vendor = 0x10de;
+        info.device = 0x2b85;
+        info.driver = "NVIDIA".into();
+        info.driver_info = "32.0.16.1656".into();
+        assert_eq!(describe(&info), "NVIDIA GeForce RTX 5090 (Dx12, DiscreteGpu, vendor 0x10de device 0x2b85, driver NVIDIA 32.0.16.1656)");
+        info.driver.clear();
+        info.driver_info.clear();
+        assert!(describe(&info).ends_with("driver unknown)"), "{}", describe(&info));
     }
 }

@@ -91,7 +91,7 @@ or worked around with `LIGHTCRAFT_GPU_BACKEND`.
 
 **The window's renderer and its fallback (Windows).** Before the window opens, each renderer is probed in
 order: DX12, Vulkan, GL, then eframe's OpenGL renderer (glow). A probe creates a device and builds egui's
-pipeline inside wgpu error scopes, so a driver that cannot compile egui's shaders ("The parameter is
+pipeline inside wgpu error scopes, so a driver that refuses egui's pipeline ("The parameter is
 incorrect. (0x80070057)" in `egui_pipeline`) is logged and skipped instead of killing the app. The renderer
 that worked is remembered in the settings folder (`window-renderer`); a start that dies before the window is up
 leaves `window-init.marker`, and the next start (relaunched automatically, at most 4 times) tries that
@@ -104,6 +104,17 @@ with `set LIGHTCRAFT_GPU_BACKEND=dx12` (the default since #136), or `=off` to ke
 rendering; `set VK_LOADER_DRIVERS_DISABLE=*igvk64*` (Vulkan loader) hides a specific Vulkan driver
 from every program started with it. Help ▸ System Info and `app.gpu` show the adapter and backend in
 use (e.g. `Intel(R) UHD Graphics 630 (Dx12)`).
+
+**"The dx12 renderer failed … The parameter is incorrect. (0x80070057)" (Windows; #812, #1366).**
+The DX12 driver refused egui's `egui_pipeline` in `CreatePipelineState` (FXC had compiled its
+shaders), so the window draws with the next renderer (Vulkan) and remembers it. Reported on two
+RTX 5090 desktops with an AMD iGPU (NVIDIA 616.56 in #812, 617.14 in #1366); an RTX 3070 Ti on
+617.42 builds the pipeline on DX12 without error, so it is not every NVIDIA card. The log line
+`window: probing …` names the adapter and driver that refused it; `adapter available` lines list
+the others. To find out *why*, install the Windows optional feature **Graphics Tools**
+(Settings → System → Optional features), then start LightCraft once with
+`set LIGHTCRAFT_GPU_BACKEND=dx12` and `set WGPU_VALIDATION=1`: the D3D12 debug layer's messages
+(the rejected parameter) go to the log. Attach that log to the issue.
 
 **Window never appears, "not responding" (Windows, NVIDIA; issue #374).** With *Shader Cache Size*
 set to **Disabled** in NVIDIA Control Panel (Manage 3D settings → Global Settings), NVIDIA's driver
